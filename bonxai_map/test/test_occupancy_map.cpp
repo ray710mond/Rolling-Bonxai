@@ -2,6 +2,7 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <set>
 #include <eigen3/Eigen/Core>
 #include "bonxai_map/occupancy_map.hpp"
 
@@ -925,6 +926,39 @@ TEST(OccupancyMapTest, RayTracingCreatesFreeCells) {
   map.getFreeVoxels(free_cells);
   
   EXPECT_GT(free_cells.size(), 1);  // Should have more than just endpoint
+}
+
+TEST(OccupancyMapTest, ObservedInsertionMatchesNormalInsertion) {
+  Bonxai::OccupancyMap normal(0.1);
+  Bonxai::OccupancyMap observed(0.1);
+  const Eigen::Vector3d origin(0, 0, 0);
+  const std::vector<Eigen::Vector3d> points{
+    {1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {20.0, 0.0, 0.0}};
+
+  normal.insertPointCloud(points, origin, 10.0);
+  std::set<Bonxai::CoordT> reported;
+  observed.insertPointCloudObserved(
+    points, origin, 10.0,
+    [&reported](const Bonxai::CoordT& coord, bool) {
+      reported.insert(coord);
+    });
+
+  std::vector<Bonxai::CoordT> normal_occupied;
+  std::vector<Bonxai::CoordT> observed_occupied;
+  std::vector<Bonxai::CoordT> normal_free;
+  std::vector<Bonxai::CoordT> observed_free;
+  normal.getOccupiedVoxels(normal_occupied);
+  observed.getOccupiedVoxels(observed_occupied);
+  normal.getFreeVoxels(normal_free);
+  observed.getFreeVoxels(observed_free);
+
+  EXPECT_EQ(
+    std::set<Bonxai::CoordT>(normal_occupied.begin(), normal_occupied.end()),
+    std::set<Bonxai::CoordT>(observed_occupied.begin(), observed_occupied.end()));
+  EXPECT_EQ(
+    std::set<Bonxai::CoordT>(normal_free.begin(), normal_free.end()),
+    std::set<Bonxai::CoordT>(observed_free.begin(), observed_free.end()));
+  EXPECT_FALSE(reported.empty());
 }
 
 // ============================================================================

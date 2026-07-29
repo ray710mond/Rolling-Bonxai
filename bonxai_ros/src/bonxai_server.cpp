@@ -7,8 +7,10 @@
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <stdexcept>
 
 #include "bonxai_core/serialization.hpp"
+#include "bonxai_ros/fusion_policy.hpp"
 
 namespace Bonxai
 {
@@ -100,6 +102,13 @@ void BonxaiServer::load_parameters()
   // --- Occupancy Threshold ---
   params_.occupancy_threshold =
     this->declare_parameter<double>("occupancy.occupancy_threshold", 0.50);
+  params_.fusion_conflict_tolerance_sec =
+    this->declare_parameter<double>("fusion.conflict_tolerance_sec", 5.0);
+  if (!std::isfinite(params_.fusion_conflict_tolerance_sec) ||
+    params_.fusion_conflict_tolerance_sec < 0.0)
+  {
+    throw std::invalid_argument("fusion.conflict_tolerance_sec must be finite and non-negative");
+  }
   
   // --- Sensor model parameters ---
   params_.sensor_max_range =
@@ -304,7 +313,7 @@ void BonxaiServer::voxel_delta_callback(
   }
   if (!std::isfinite(msg->resolution) || msg->resolution <= 0.0 ||
     msg->y.size() != count || msg->z.size() != count ||
-    msg->state.size() != count)
+    msg->state.size() != count || msg->observation_time_ns.size() != count)
   {
     RCLCPP_WARN(get_logger(), "Rejected malformed voxel delta from %s",
       msg->source_id.c_str());
@@ -434,21 +443,30 @@ void BonxaiServer::apply_voxel_delta(
           const Bonxai::CoordT coord{
             static_cast<int32_t>(x), static_cast<int32_t>(y), static_cast<int32_t>(z)};
           source.occupancy->resetPoint(coord);
+          const uint64_t observation_time_ns = msg.observation_time_ns[index];
           switch (state) {
             case surf_multirobot_msgs::msg::VoxelDelta::STATE_OCCUPIED_STATIC:
               source.occupancy->addHitPoint(coord);
               source.dynamic_voxels.erase(coord);
+              source.observation_times_ns[coord] = observation_time_ns;
+              source.deleted_observation_times_ns.erase(coord);
               break;
             case surf_multirobot_msgs::msg::VoxelDelta::STATE_OCCUPIED_DYNAMIC:
               source.occupancy->addHitPoint(coord);
               source.dynamic_voxels.insert(coord);
+              source.observation_times_ns[coord] = observation_time_ns;
+              source.deleted_observation_times_ns.erase(coord);
               break;
             case surf_multirobot_msgs::msg::VoxelDelta::STATE_FREE:
               source.occupancy->addMissPoint(coord);
               source.dynamic_voxels.erase(coord);
+              source.observation_times_ns[coord] = observation_time_ns;
+              source.deleted_observation_times_ns.erase(coord);
               break;
             case surf_multirobot_msgs::msg::VoxelDelta::STATE_DELETE:
               source.dynamic_voxels.erase(coord);
+              source.observation_times_ns.erase(coord);
+              source.deleted_observation_times_ns[coord] = observation_time_ns;
               break;
             default:
               break;
@@ -472,26 +490,73 @@ void BonxaiServer::reset_remote_source(RemoteSourceLayer & source, uint64_t map_
   source.occupancy = std::make_unique<Bonxai::OccupancyMap>(
     params_.static_resolution, occupancy_map_->getOptions());
   source.dynamic_voxels.clear();
+  source.observation_times_ns.clear();
+  source.deleted_observation_times_ns.clear();
 }
 
-void BonxaiServer::get_fused_occupied_voxels(
-  std::vector<Bonxai::CoordT> & coords, bool include_static, bool include_dynamic) const
+void BonxaiServer::get_fused_voxel_states(
+  std::set<Bonxai::CoordT> & occupied, std::set<Bonxai::CoordT> & free,
+  bool include_static, bool include_dynamic) const
 {
-  std::set<Bonxai::CoordT> unique_coords;
+  struct Evidence
+  {
+    bool has_occupied{false};
+    bool has_free{false};
+    uint64_t newest_occupied_ns{0U};
+    uint64_t newest_free_ns{0U};
+  };
+  std::map<Bonxai::CoordT, Evidence> evidence;
+  auto add_occupied = [&evidence](const Bonxai::CoordT & coord, uint64_t stamp) {
+      auto & item = evidence[coord];
+      item.has_occupied = true;
+      item.newest_occupied_ns = std::max(item.newest_occupied_ns, stamp);
+    };
+  auto add_free = [&evidence](const Bonxai::CoordT & coord, uint64_t stamp) {
+      auto & item = evidence[coord];
+      item.has_free = true;
+      item.newest_free_ns = std::max(item.newest_free_ns, stamp);
+    };
+  std::unique_lock<std::mutex> local_times_lock(local_observation_times_mutex_);
+  auto local_stamp = [this](const Bonxai::CoordT & coord) {
+      const auto found = local_observation_times_ns_.find(coord);
+      return found == local_observation_times_ns_.end() ? 0U : found->second;
+    };
+
   if (include_static && occupancy_map_) {
     std::vector<Bonxai::CoordT> local_static;
     occupancy_map_->getOccupiedVoxels(local_static);
-    unique_coords.insert(local_static.begin(), local_static.end());
+    for (const auto & coord : local_static) {
+      add_occupied(coord, local_stamp(coord));
+    }
   }
   if (include_dynamic && dynamic_obstacle_map_) {
     std::vector<Bonxai::CoordT> local_dynamic;
     get_dynamic_obstacle_voxels(local_dynamic);
     for (const auto & coord : local_dynamic) {
       const auto position = dynamic_obstacle_map_->getGrid().coordToPos(coord);
-      unique_coords.insert(occupancy_map_->worldToVoxel(
-        Eigen::Vector3d(position.x, position.y, position.z)));
+      const auto static_coord = occupancy_map_->worldToVoxel(
+        Eigen::Vector3d(position.x, position.y, position.z));
+      add_occupied(static_coord, local_stamp(static_coord));
     }
   }
+  if (occupancy_map_) {
+    std::vector<Bonxai::CoordT> local_free;
+    occupancy_map_->getFreeVoxels(local_free);
+    for (const auto & coord : local_free) {
+      add_free(coord, local_stamp(coord));
+    }
+  }
+  if (include_dynamic && dynamic_obstacle_map_) {
+    std::vector<Bonxai::CoordT> local_dynamic_free;
+    dynamic_obstacle_map_->getFreeVoxels(local_dynamic_free);
+    for (const auto & coord : local_dynamic_free) {
+      const auto position = dynamic_obstacle_map_->getGrid().coordToPos(coord);
+      const auto static_coord = occupancy_map_->worldToVoxel(
+        Eigen::Vector3d(position.x, position.y, position.z));
+      add_free(static_coord, local_stamp(static_coord));
+    }
+  }
+  local_times_lock.unlock();
 
   std::lock_guard<std::mutex> lock(remote_sources_mutex_);
   for (const auto & [source_id, source] : remote_sources_) {
@@ -504,20 +569,121 @@ void BonxaiServer::get_fused_occupied_voxels(
     for (const auto & coord : remote_occupied) {
       const bool dynamic = source.dynamic_voxels.find(coord) != source.dynamic_voxels.end();
       if ((dynamic && include_dynamic) || (!dynamic && include_static)) {
-        unique_coords.insert(coord);
+        const auto stamp = source.observation_times_ns.find(coord);
+        add_occupied(coord, stamp == source.observation_times_ns.end() ? 0U : stamp->second);
+      }
+    }
+    std::vector<Bonxai::CoordT> remote_free;
+    source.occupancy->getFreeVoxels(remote_free);
+    for (const auto & coord : remote_free) {
+      const auto stamp = source.observation_times_ns.find(coord);
+      add_free(coord, stamp == source.observation_times_ns.end() ? 0U : stamp->second);
+    }
+    // DELETE removes the voxel from the remote occupancy layer, but the sender
+    // emits it only after scan-based clearing evidence. Retain that timestamped
+    // free evidence for cross-source conflict resolution.
+    for (const auto & [coord, stamp] : source.deleted_observation_times_ns) {
+      add_free(coord, stamp);
+    }
+  }
+
+  occupied.clear();
+  free.clear();
+  const uint64_t tolerance_ns = static_cast<uint64_t>(
+    params_.fusion_conflict_tolerance_sec * 1000000000.0);
+  for (const auto & [coord, item] : evidence) {
+    if (!item.has_occupied) {
+      free.insert(coord);
+      continue;
+    }
+    if (!item.has_free) {
+      occupied.insert(coord);
+      continue;
+    }
+    const auto state = resolve_fused_voxel_state(
+      item.has_occupied, item.newest_occupied_ns,
+      item.has_free, item.newest_free_ns, tolerance_ns);
+    if (state == FusedVoxelState::Occupied) {
+      occupied.insert(coord);
+    } else if (state == FusedVoxelState::Free) {
+      free.insert(coord);
+    }
+  }
+}
+
+void BonxaiServer::get_fused_occupied_voxels(
+  std::vector<Bonxai::CoordT> & coords, bool include_static, bool include_dynamic) const
+{
+  std::map<Bonxai::CoordT, uint64_t> occupied_candidates;
+  auto add_candidate = [&occupied_candidates](const Bonxai::CoordT & coord, uint64_t stamp) {
+      auto [it, inserted] = occupied_candidates.try_emplace(coord, stamp);
+      if (!inserted) {
+        it->second = std::max(it->second, stamp);
+      }
+    };
+
+  {
+    std::lock_guard<std::mutex> lock(local_observation_times_mutex_);
+    auto local_stamp = [this](const Bonxai::CoordT & coord) {
+        const auto found = local_observation_times_ns_.find(coord);
+        return found == local_observation_times_ns_.end() ? 0U : found->second;
+      };
+    if (include_static && occupancy_map_) {
+      std::vector<Bonxai::CoordT> local_static;
+      occupancy_map_->getOccupiedVoxels(local_static);
+      for (const auto & coord : local_static) {
+        add_candidate(coord, local_stamp(coord));
+      }
+    }
+    if (include_dynamic && dynamic_obstacle_map_) {
+      std::vector<Bonxai::CoordT> local_dynamic;
+      get_dynamic_obstacle_voxels(local_dynamic);
+      for (const auto & coord : local_dynamic) {
+        const auto position = dynamic_obstacle_map_->getGrid().coordToPos(coord);
+        const auto static_coord = occupancy_map_->worldToVoxel(
+          Eigen::Vector3d(position.x, position.y, position.z));
+        add_candidate(static_coord, local_stamp(static_coord));
       }
     }
   }
-  coords.assign(unique_coords.begin(), unique_coords.end());
-}
 
-void BonxaiServer::get_fused_free_voxels(std::vector<Bonxai::CoordT> & coords) const
-{
-  std::set<Bonxai::CoordT> unique_coords;
-  if (occupancy_map_) {
-    std::vector<Bonxai::CoordT> local_free;
-    occupancy_map_->getFreeVoxels(local_free);
-    unique_coords.insert(local_free.begin(), local_free.end());
+  {
+    std::lock_guard<std::mutex> lock(remote_sources_mutex_);
+    for (const auto & [source_id, source] : remote_sources_) {
+      (void)source_id;
+      if (!source.occupancy || source.awaiting_full_refresh) {
+        continue;
+      }
+      std::vector<Bonxai::CoordT> remote_occupied;
+      source.occupancy->getOccupiedVoxels(remote_occupied);
+      for (const auto & coord : remote_occupied) {
+        const bool dynamic = source.dynamic_voxels.find(coord) != source.dynamic_voxels.end();
+        if ((dynamic && include_dynamic) || (!dynamic && include_static)) {
+          const auto stamp = source.observation_times_ns.find(coord);
+          add_candidate(coord, stamp == source.observation_times_ns.end() ? 0U : stamp->second);
+        }
+      }
+    }
+  }
+
+  std::map<Bonxai::CoordT, uint64_t> newest_free;
+  {
+    std::lock_guard<std::mutex> lock(local_observation_times_mutex_);
+    for (const auto & [coord, occupied_stamp] : occupied_candidates) {
+      (void)occupied_stamp;
+      bool locally_free = occupancy_map_ && occupancy_map_->isFree(coord);
+      if (include_dynamic && dynamic_obstacle_map_) {
+        const auto position = occupancy_map_->getGrid().coordToPos(coord);
+        locally_free = locally_free || dynamic_obstacle_map_->isFree(
+          dynamic_obstacle_map_->worldToVoxel(
+            Eigen::Vector3d(position.x, position.y, position.z)));
+      }
+      if (locally_free) {
+        const auto stamp = local_observation_times_ns_.find(coord);
+        newest_free[coord] =
+          stamp == local_observation_times_ns_.end() ? 0U : stamp->second;
+      }
+    }
   }
   {
     std::lock_guard<std::mutex> lock(remote_sources_mutex_);
@@ -526,18 +692,52 @@ void BonxaiServer::get_fused_free_voxels(std::vector<Bonxai::CoordT> & coords) c
       if (!source.occupancy || source.awaiting_full_refresh) {
         continue;
       }
-      std::vector<Bonxai::CoordT> remote_free;
-      source.occupancy->getFreeVoxels(remote_free);
-      unique_coords.insert(remote_free.begin(), remote_free.end());
+      for (const auto & [coord, occupied_stamp] : occupied_candidates) {
+        (void)occupied_stamp;
+        uint64_t free_stamp = 0U;
+        bool has_free = false;
+        if (source.occupancy->isFree(coord)) {
+          const auto stamp = source.observation_times_ns.find(coord);
+          free_stamp = stamp == source.observation_times_ns.end() ? 0U : stamp->second;
+          has_free = true;
+        }
+        const auto deleted = source.deleted_observation_times_ns.find(coord);
+        if (deleted != source.deleted_observation_times_ns.end()) {
+          free_stamp = std::max(free_stamp, deleted->second);
+          has_free = true;
+        }
+        if (has_free) {
+          auto [it, inserted] = newest_free.try_emplace(coord, free_stamp);
+          if (!inserted) {
+            it->second = std::max(it->second, free_stamp);
+          }
+        }
+      }
     }
   }
 
-  std::vector<Bonxai::CoordT> occupied;
-  get_fused_occupied_voxels(occupied, true, true);
-  for (const auto & coord : occupied) {
-    unique_coords.erase(coord);
+  const uint64_t tolerance_ns = static_cast<uint64_t>(
+    params_.fusion_conflict_tolerance_sec * 1000000000.0);
+  coords.clear();
+  coords.reserve(occupied_candidates.size());
+  for (const auto & [coord, occupied_stamp] : occupied_candidates) {
+    const auto free = newest_free.find(coord);
+    if (free == newest_free.end() ||
+      resolve_fused_voxel_state(
+        true, occupied_stamp, true, free->second, tolerance_ns) ==
+      FusedVoxelState::Occupied)
+    {
+      coords.push_back(coord);
+    }
   }
-  coords.assign(unique_coords.begin(), unique_coords.end());
+}
+
+void BonxaiServer::get_fused_free_voxels(std::vector<Bonxai::CoordT> & coords) const
+{
+  std::set<Bonxai::CoordT> occupied_set;
+  std::set<Bonxai::CoordT> free_set;
+  get_fused_voxel_states(occupied_set, free_set, true, true);
+  coords.assign(free_set.begin(), free_set.end());
 }
 
 void BonxaiServer::init_timers()
@@ -665,10 +865,18 @@ void BonxaiServer::pointcloud_callback(const sensor_msgs::msg::PointCloud2::Shar
   }
   
   // Update static and dynamic occupancy layers
+  const int64_t signed_scan_time_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
+  const uint64_t scan_time_ns =
+    signed_scan_time_ns > 0 ? static_cast<uint64_t>(signed_scan_time_ns) : 0U;
   if (params_.dynamic_obstacles_enabled) {
-    update_dynamic_obstacle_layer(map_points, sensor_origin);
+    update_dynamic_obstacle_layer(map_points, sensor_origin, scan_time_ns);
   } else {
-    occupancy_map_->insertPointCloud(map_points, sensor_origin, params_.sensor_max_range);
+    std::lock_guard<std::mutex> lock(local_observation_times_mutex_);
+    occupancy_map_->insertPointCloudObserved(
+      map_points, sensor_origin, params_.sensor_max_range,
+      [this, scan_time_ns](const Bonxai::CoordT & coord, bool) {
+        local_observation_times_ns_[coord] = scan_time_ns;
+      });
   }
 
   if (!updated_map_once_){
@@ -687,13 +895,24 @@ void BonxaiServer::pointcloud_callback(const sensor_msgs::msg::PointCloud2::Shar
 
 void BonxaiServer::update_dynamic_obstacle_layer(
   const std::vector<Eigen::Vector3d>& map_points,
-  const Eigen::Vector3d& sensor_origin)
+  const Eigen::Vector3d& sensor_origin,
+  uint64_t observation_time_ns)
 {
   if (!dynamic_obstacle_map_) {
     return;
   }
 
-  dynamic_obstacle_map_->insertPointCloud(map_points, sensor_origin, params_.sensor_max_range);
+  {
+    std::lock_guard<std::mutex> lock(local_observation_times_mutex_);
+    dynamic_obstacle_map_->insertPointCloudObserved(
+      map_points, sensor_origin, params_.sensor_max_range,
+      [this, observation_time_ns](const Bonxai::CoordT & coord, bool) {
+        const Bonxai::CoordT static_coord =
+          params_.dynamic_resolution == params_.static_resolution ?
+          coord : dynamic_to_static_coord(coord);
+        local_observation_times_ns_[static_coord] = observation_time_ns;
+      });
+  }
 
   const auto now = std::chrono::steady_clock::now();
   std::set<Bonxai::CoordT> observed_voxels;

@@ -10,6 +10,10 @@ bonxai_server_node:
       occupancy_min_z: -100.0
       occupancy_max_z: 100.0
       occupancy_threshold: 0.50
+
+    fusion:
+      # Occupied wins for conflicts within this scan-time window.
+      conflict_tolerance_sec: 5.0
     
     sensor_model:
       max_range: 10.0

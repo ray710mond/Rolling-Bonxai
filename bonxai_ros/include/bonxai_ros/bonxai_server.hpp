@@ -8,6 +8,7 @@
 #include <mutex>
 #include <set>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 // ROS2
@@ -52,6 +53,7 @@ struct BonxaiParams
   double occupancy_min_z{0.0};
   double occupancy_max_z{0.0};
   double occupancy_threshold{0.50};
+  double fusion_conflict_tolerance_sec{5.0};
 
   double sensor_max_range{0.0};
   double sensor_hit{0.0};
@@ -101,6 +103,8 @@ struct RemoteSourceLayer
   bool awaiting_full_refresh{true};
   std::unique_ptr<Bonxai::OccupancyMap> occupancy;
   std::set<Bonxai::CoordT> dynamic_voxels;
+  std::map<Bonxai::CoordT, uint64_t> observation_times_ns;
+  std::map<Bonxai::CoordT, uint64_t> deleted_observation_times_ns;
 };
 
 class BonxaiServer : public rclcpp::Node
@@ -128,6 +132,9 @@ private:
   void get_fused_occupied_voxels(
     std::vector<Bonxai::CoordT> & coords, bool include_static, bool include_dynamic) const;
   void get_fused_free_voxels(std::vector<Bonxai::CoordT> & coords) const;
+  void get_fused_voxel_states(
+    std::set<Bonxai::CoordT> & occupied, std::set<Bonxai::CoordT> & free,
+    bool include_static, bool include_dynamic) const;
   
   // Service handlers
   void handle_get_occupied_voxels(
@@ -160,7 +167,8 @@ private:
 
   void update_dynamic_obstacle_layer(
     const std::vector<Eigen::Vector3d>& map_points,
-    const Eigen::Vector3d& sensor_origin);
+    const Eigen::Vector3d& sensor_origin,
+    uint64_t observation_time_ns);
 
   void get_dynamic_obstacle_voxels(std::vector<Bonxai::CoordT>& coords) const;
   Bonxai::CoordT dynamic_to_static_coord(const Bonxai::CoordT& coord) const;
@@ -189,6 +197,8 @@ private:
   std::map<std::tuple<int32_t, int32_t, int32_t>, DynamicCellState> dynamic_obstacle_states_;
   std::map<std::string, RemoteSourceLayer> remote_sources_;
   mutable std::mutex remote_sources_mutex_;
+  std::unordered_map<Bonxai::CoordT, uint64_t> local_observation_times_ns_;
+  mutable std::mutex local_observation_times_mutex_;
 
   // TF
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;

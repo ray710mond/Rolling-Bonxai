@@ -536,6 +536,63 @@ public:
         
         updateFreeCells(from_point);
     }
+
+    /**
+     * @brief Insert a point cloud and report each voxel whose evidence is updated.
+     *
+     * The observer receives (coordinate, occupied), where occupied is true for
+     * an in-range return endpoint and false for free-ray or max-range evidence.
+     * This avoids a second ray trace when callers need per-voxel metadata.
+     */
+    template <typename PointT, typename Allocator, typename Observer>
+    void insertPointCloudObserved(const std::vector<PointT, Allocator>& points,
+                                  const PointT& origin,
+                                  double max_range,
+                                  Observer&& observer) {
+        const auto from_point = ConvertPoint<Vector3D>(origin);
+        const double max_range_sq = max_range * max_range;
+        ensureAccessorValid();
+
+        for (const auto& point : points) {
+            const auto to_point = ConvertPoint<Vector3D>(point);
+            Vector3D vector_from_to = to_point - from_point;
+            const double squared_norm = vector_from_to.squaredNorm();
+
+            if (squared_norm >= max_range_sq) {
+                Vector3D vector_from_to_unit = vector_from_to / std::sqrt(squared_norm);
+                const Vector3D new_to_point = from_point + (vector_from_to_unit * max_range);
+                const CoordT coord = grid_.posToCoord(new_to_point);
+                addMissPoint(coord);
+                observer(coord, false);
+            } else {
+                const CoordT coord = grid_.posToCoord(to_point);
+                addHitPoint(coord);
+                observer(coord, true);
+            }
+        }
+
+        auto clear_point = [this, &observer](const CoordT& coord) {
+            Occupancy::CellOcc* cell = accessor_->value(coord, true);
+            if (cell->update_id != update_count_) {
+                cell->probability_log = std::max(
+                    cell->probability_log + options_.prob_miss_log,
+                    options_.clamp_min_log);
+                cell->update_id = update_count_;
+                observer(coord, false);
+            }
+            return true;
+        };
+        const CoordT coord_origin = grid_.posToCoord(from_point);
+        for (const auto& coord_end : hit_coords_) {
+            Occupancy::RayIterator(coord_origin, coord_end, clear_point);
+        }
+        hit_coords_.clear();
+        for (const auto& coord_end : miss_coords_) {
+            Occupancy::RayIterator(coord_origin, coord_end, clear_point);
+        }
+        miss_coords_.clear();
+        incrementUpdateCount();
+    }
     
     // ========================================================================
     // Memory Management
