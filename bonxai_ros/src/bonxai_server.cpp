@@ -232,6 +232,12 @@ void BonxaiServer::init_publishers()
     if (params_.publish_occupied_voxels) {
       occupied_voxel_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
         "bonxai/occupied_voxels", rclcpp::QoS(10));
+      local_occupied_voxel_publisher_ =
+        this->create_publisher<sensor_msgs::msg::PointCloud2>(
+          "bonxai/local_occupied_voxels", rclcpp::QoS(10));
+      drone_occupied_voxel_publisher_ =
+        this->create_publisher<sensor_msgs::msg::PointCloud2>(
+          "bonxai/drone_occupied_voxels", rclcpp::QoS(10));
       static_voxel_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
         "bonxai/static_occupied_voxels", rclcpp::QoS(10));
       dynamic_voxel_publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -257,7 +263,9 @@ void BonxaiServer::init_subscribers()
   if (!params_.delta_topic_in.empty()) {
     delta_sub_ = this->create_subscription<surf_multirobot_msgs::msg::VoxelDelta>(
       params_.delta_topic_in,
-      rclcpp::QoS(rclcpp::KeepLast(10)).reliable().durability_volatile(),
+      // Match the receiver's retained history so startup ordering cannot make
+      // this server miss the full refresh required before incremental deltas.
+      rclcpp::QoS(rclcpp::KeepLast(128)).reliable().transient_local(),
       std::bind(&BonxaiServer::voxel_delta_callback, this, std::placeholders::_1));
     RCLCPP_INFO(get_logger(), "Subscribed to remote voxel deltas: %s",
       params_.delta_topic_in.c_str());
@@ -738,6 +746,41 @@ void BonxaiServer::get_fused_free_voxels(std::vector<Bonxai::CoordT> & coords) c
   std::set<Bonxai::CoordT> free_set;
   get_fused_voxel_states(occupied_set, free_set, true, true);
   coords.assign(free_set.begin(), free_set.end());
+}
+
+void BonxaiServer::get_local_occupied_voxels(
+  std::vector<Bonxai::CoordT> & coords) const
+{
+  std::set<Bonxai::CoordT> occupied;
+  if (occupancy_map_) {
+    std::vector<Bonxai::CoordT> local_static;
+    occupancy_map_->getOccupiedVoxels(local_static);
+    occupied.insert(local_static.begin(), local_static.end());
+  }
+  if (occupancy_map_ && dynamic_obstacle_map_) {
+    std::vector<Bonxai::CoordT> local_dynamic;
+    get_dynamic_obstacle_voxels(local_dynamic);
+    for (const auto & coord : local_dynamic) {
+      const auto position = dynamic_obstacle_map_->getGrid().coordToPos(coord);
+      occupied.insert(occupancy_map_->worldToVoxel(
+        Eigen::Vector3d(position.x, position.y, position.z)));
+    }
+  }
+  coords.assign(occupied.begin(), occupied.end());
+}
+
+void BonxaiServer::get_remote_occupied_voxels(
+  const std::string & source_id, std::vector<Bonxai::CoordT> & coords) const
+{
+  coords.clear();
+  std::lock_guard<std::mutex> lock(remote_sources_mutex_);
+  const auto source = remote_sources_.find(source_id);
+  if (source == remote_sources_.end() || !source->second.occupancy ||
+    source->second.awaiting_full_refresh)
+  {
+    return;
+  }
+  source->second.occupancy->getOccupiedVoxels(coords);
 }
 
 void BonxaiServer::init_timers()
@@ -1422,6 +1465,22 @@ void BonxaiServer::stats_timer_callback()
 
   if (occupied_voxel_publisher_) {
     occupied_voxel_publisher_->publish(pcl_msg);
+  }
+
+  if (local_occupied_voxel_publisher_) {
+    std::vector<Bonxai::CoordT> local_coords;
+    sensor_msgs::msg::PointCloud2 local_message;
+    get_local_occupied_voxels(local_coords);
+    fill_pcl_msg(local_coords, local_message, *occupancy_map_);
+    local_occupied_voxel_publisher_->publish(local_message);
+  }
+
+  if (drone_occupied_voxel_publisher_) {
+    std::vector<Bonxai::CoordT> drone_coords;
+    sensor_msgs::msg::PointCloud2 drone_message;
+    get_remote_occupied_voxels("drone", drone_coords);
+    fill_pcl_msg(drone_coords, drone_message, *occupancy_map_);
+    drone_occupied_voxel_publisher_->publish(drone_message);
   }
 
   RCLCPP_INFO_STREAM(get_logger(),"Got " << coords.size() << "Occupied Voxels!");

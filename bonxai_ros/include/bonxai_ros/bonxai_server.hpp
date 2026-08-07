@@ -131,6 +131,9 @@ private:
   void reset_remote_source(RemoteSourceLayer & source, uint64_t map_epoch);
   void get_fused_occupied_voxels(
     std::vector<Bonxai::CoordT> & coords, bool include_static, bool include_dynamic) const;
+  void get_local_occupied_voxels(std::vector<Bonxai::CoordT> & coords) const;
+  void get_remote_occupied_voxels(
+    const std::string & source_id, std::vector<Bonxai::CoordT> & coords) const;
   void get_fused_free_voxels(std::vector<Bonxai::CoordT> & coords) const;
   void get_fused_voxel_states(
     std::set<Bonxai::CoordT> & occupied, std::set<Bonxai::CoordT> & free,
@@ -217,6 +220,8 @@ private:
   // Publishers
   rclcpp::Publisher<bonxai_msgs::msg::OccupancyMapStats>::SharedPtr stats_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr occupied_voxel_publisher_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr local_occupied_voxel_publisher_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr drone_occupied_voxel_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr static_voxel_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr dynamic_voxel_publisher_;
   
