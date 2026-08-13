@@ -8,6 +8,7 @@
 #include <fstream>
 #include <set>
 #include <stdexcept>
+#include <unordered_set>
 
 #include "bonxai_core/serialization.hpp"
 #include "bonxai_ros/fusion_policy.hpp"
@@ -883,6 +884,11 @@ void BonxaiServer::pointcloud_callback(const sensor_msgs::msg::PointCloud2::Shar
   // Transform points to map frame and filter by Z
   std::vector<Eigen::Vector3d> map_points;
   map_points.reserve(cloud->size());
+  std::unordered_set<Bonxai::CoordT> endpoint_voxels;
+  endpoint_voxels.reserve(cloud->size() / 4U);
+  const Bonxai::OccupancyMap & endpoint_map =
+    params_.dynamic_obstacles_enabled && dynamic_obstacle_map_ ?
+    *dynamic_obstacle_map_ : *occupancy_map_;
   
   for (const auto& point : cloud->points) {
     // Skip invalid points
@@ -899,7 +905,13 @@ void BonxaiServer::pointcloud_callback(const sensor_msgs::msg::PointCloud2::Shar
       continue;
     }
     
-    map_points.push_back(point_map);
+    // Multiple camera pixels commonly land in the same 5 cm voxel. They
+    // provide identical map-resolution endpoint evidence. Retain one endpoint
+    // per voxel before occupancy insertion, avoiding redundant accessor and
+    // observer work without reducing camera resolution or frame rate.
+    if (endpoint_voxels.insert(endpoint_map.worldToVoxel(point_map)).second) {
+      map_points.push_back(point_map);
+    }
   }
   
   if (map_points.empty()) {
@@ -1452,22 +1464,23 @@ void BonxaiServer::stats_timer_callback()
     return;
   }
   
-  sensor_msgs::msg::PointCloud2 pcl_msg;
-  std::vector<Bonxai::CoordT> coords;
-  get_fused_occupied_voxels(coords, true, params_.dynamic_obstacles_enabled);
-
-  fill_pcl_msg(coords, pcl_msg, *occupancy_map_);
-
   bonxai_msgs::msg::OccupancyMapStats msg;
   fill_stats_msg(msg);
-  
   stats_publisher_->publish(msg);
 
-  if (occupied_voxel_publisher_) {
+  std::size_t fused_count = 0U;
+  if (occupied_voxel_publisher_ && occupied_voxel_publisher_->get_subscription_count() > 0U) {
+    sensor_msgs::msg::PointCloud2 pcl_msg;
+    std::vector<Bonxai::CoordT> coords;
+    get_fused_occupied_voxels(coords, true, params_.dynamic_obstacles_enabled);
+    fused_count = coords.size();
+    fill_pcl_msg(coords, pcl_msg, *occupancy_map_);
     occupied_voxel_publisher_->publish(pcl_msg);
   }
 
-  if (local_occupied_voxel_publisher_) {
+  if (local_occupied_voxel_publisher_ &&
+    local_occupied_voxel_publisher_->get_subscription_count() > 0U)
+  {
     std::vector<Bonxai::CoordT> local_coords;
     sensor_msgs::msg::PointCloud2 local_message;
     get_local_occupied_voxels(local_coords);
@@ -1475,7 +1488,9 @@ void BonxaiServer::stats_timer_callback()
     local_occupied_voxel_publisher_->publish(local_message);
   }
 
-  if (drone_occupied_voxel_publisher_) {
+  if (drone_occupied_voxel_publisher_ &&
+    drone_occupied_voxel_publisher_->get_subscription_count() > 0U)
+  {
     std::vector<Bonxai::CoordT> drone_coords;
     sensor_msgs::msg::PointCloud2 drone_message;
     get_remote_occupied_voxels("drone", drone_coords);
@@ -1483,8 +1498,8 @@ void BonxaiServer::stats_timer_callback()
     drone_occupied_voxel_publisher_->publish(drone_message);
   }
 
-  RCLCPP_INFO_STREAM(get_logger(),"Got " << coords.size() << "Occupied Voxels!");
-  RCLCPP_INFO(get_logger(),
+  RCLCPP_DEBUG(get_logger(), "Published %zu fused occupied voxels", fused_count);
+  RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
     "Stats published: %lu active cells, %.1f MB, occupancy=%.2f%%",
     msg.total_active_cells,
     static_cast<double>(msg.total_memory_mib),
@@ -1493,7 +1508,9 @@ void BonxaiServer::stats_timer_callback()
 
 void BonxaiServer::static_voxel_timer_callback()
 {
-  if (!occupancy_map_ || !static_voxel_publisher_) {
+  if (!occupancy_map_ || !static_voxel_publisher_ ||
+    static_voxel_publisher_->get_subscription_count() == 0U)
+  {
     return;
   }
 
@@ -1511,7 +1528,9 @@ void BonxaiServer::static_voxel_timer_callback()
 
 void BonxaiServer::dynamic_voxel_timer_callback()
 {
-  if (!occupancy_map_ || !dynamic_obstacle_map_ || !dynamic_voxel_publisher_) {
+  if (!occupancy_map_ || !dynamic_obstacle_map_ || !dynamic_voxel_publisher_ ||
+    dynamic_voxel_publisher_->get_subscription_count() == 0U)
+  {
     return;
   }
 
