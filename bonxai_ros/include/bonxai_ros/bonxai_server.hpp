@@ -83,6 +83,7 @@ struct BonxaiParams
 
   // Static map persistence
   std::string static_map_path;
+  std::string static_map_pcd_path;
   bool static_map_load_on_startup{false};
   bool static_map_save_on_shutdown{true};
   

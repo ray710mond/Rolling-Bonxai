@@ -27,6 +27,8 @@ bonxai_server_node:
 
     map_storage:
       path: ""
+      # Empty derives a sibling .pcd path from map_storage.path.
+      pcd_path: ""
       load_on_startup: true
       save_on_shutdown: true
 

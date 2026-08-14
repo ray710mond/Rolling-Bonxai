@@ -2,6 +2,7 @@
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <pcl/io/pcd_io.h>
 
 #include <cmath>
 #include <filesystem>
@@ -165,6 +166,8 @@ void BonxaiServer::load_parameters()
 
   params_.static_map_path =
     this->declare_parameter<std::string>("map_storage.path", "");
+  params_.static_map_pcd_path =
+    this->declare_parameter<std::string>("map_storage.pcd_path", "");
   params_.static_map_load_on_startup =
     this->declare_parameter<bool>("map_storage.load_on_startup", false);
   params_.static_map_save_on_shutdown =
@@ -1100,11 +1103,20 @@ bool BonxaiServer::save_static_map(std::string& error_message) const
 
   try {
     const std::filesystem::path map_path(params_.static_map_path);
+    std::filesystem::path pcd_path(params_.static_map_pcd_path);
+    if (pcd_path.empty()) {
+      pcd_path = map_path;
+      pcd_path.replace_extension(".pcd");
+    }
     if (map_path.has_parent_path()) {
       std::filesystem::create_directories(map_path.parent_path());
     }
+    if (pcd_path.has_parent_path()) {
+      std::filesystem::create_directories(pcd_path.parent_path());
+    }
 
     const std::filesystem::path temporary_path = map_path.string() + ".tmp";
+    const std::filesystem::path temporary_pcd_path = pcd_path.string() + ".tmp";
     {
       std::ofstream output(temporary_path, std::ios::binary | std::ios::trunc);
       if (!output) {
@@ -1118,12 +1130,34 @@ bool BonxaiServer::save_static_map(std::string& error_message) const
         return false;
       }
     }
+
+    std::vector<Bonxai::CoordT> occupied_coords;
+    get_fused_occupied_voxels(occupied_coords, true, false);
+    pcl::PointCloud<pcl::PointXYZ> localization_cloud;
+    localization_cloud.points.reserve(occupied_coords.size());
+    for (const auto & coord : occupied_coords) {
+      const auto point = occupancy_map_->getGrid().coordToPos(coord);
+      localization_cloud.points.emplace_back(point.x, point.y, point.z);
+    }
+    localization_cloud.width = static_cast<std::uint32_t>(localization_cloud.points.size());
+    localization_cloud.height = 1U;
+    localization_cloud.is_dense = true;
+    if (pcl::io::savePCDFileBinary(temporary_pcd_path.string(), localization_cloud) != 0) {
+      std::filesystem::remove(temporary_path);
+      std::filesystem::remove(temporary_pcd_path);
+      error_message = "could not write localization PCD: " + pcd_path.string();
+      return false;
+    }
+
     std::filesystem::rename(temporary_path, map_path);
+    std::filesystem::rename(temporary_pcd_path, pcd_path);
 
     std::ofstream metadata(map_path.string() + ".yaml", std::ios::trunc);
     if (metadata) {
       metadata << "format: bonxai_static_map_v1\n"
                << "map_file: " << map_path.filename().string() << "\n"
+               << "localization_pcd: " << pcd_path.filename().string() << "\n"
+               << "localization_points: " << localization_cloud.points.size() << "\n"
                << "frame_id: " << params_.frame_id << "\n"
                << "resolution: " << params_.static_resolution << "\n";
     }
@@ -1187,9 +1221,17 @@ void BonxaiServer::handle_save_static_map(
 {
   std::string error_message;
   response->success = save_static_map(error_message);
-  response->message = response->success
-    ? "Saved static map to " + params_.static_map_path
-    : error_message;
+  if (response->success) {
+    std::filesystem::path pcd_path(params_.static_map_pcd_path);
+    if (pcd_path.empty()) {
+      pcd_path = params_.static_map_path;
+      pcd_path.replace_extension(".pcd");
+    }
+    response->message = "Saved static map to " + params_.static_map_path +
+      " and localization cloud to " + pcd_path.string();
+  } else {
+    response->message = error_message;
+  }
 }
 
 void BonxaiServer::handle_load_static_map(
