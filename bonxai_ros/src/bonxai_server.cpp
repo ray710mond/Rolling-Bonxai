@@ -111,6 +111,8 @@ void BonxaiServer::load_parameters()
   {
     throw std::invalid_argument("fusion.conflict_tolerance_sec must be finite and non-negative");
   }
+  params_.fusion_require_both_localized = this->declare_parameter<bool>(
+    "fusion.require_both_localized", true);
   
   // --- Sensor model parameters ---
   params_.sensor_max_range =
@@ -184,6 +186,7 @@ void BonxaiServer::load_parameters()
     "\n  sensor(hit=%.2f miss=%.2f min=%.2f max=%.2f range=%.2f)"
     "\n  cleanup_interval=%.1fs"
     "\n  stats(enabled=%s quick=%s voxels=%s stats_rate=%.1fHz static_rate=%.1fHz dynamic_rate=%.1fHz)"
+    "\n  fusion(require_both_localized=%s)"
     "\n  dynamic_obstacles(enabled=%s dynamic_decay=%.2fs interval=%.2fs static_demotion=%.2fs stability_hits=%d stability_window=%.2fs)",
     params_.static_resolution,
     params_.dynamic_resolution,
@@ -205,6 +208,7 @@ void BonxaiServer::load_parameters()
     params_.stats_publish_rate,
     params_.static_voxel_publish_rate,
     params_.dynamic_voxel_publish_rate,
+    params_.fusion_require_both_localized ? "true" : "false",
     params_.dynamic_obstacles_enabled ? "true" : "false",
     params_.dynamic_obstacle_decay_time_sec,
     params_.dynamic_obstacle_decay_interval_sec,
@@ -310,6 +314,14 @@ void BonxaiServer::init_services()
 void BonxaiServer::voxel_delta_callback(
   const surf_multirobot_msgs::msg::VoxelDelta::SharedPtr msg)
 {
+  if (params_.fusion_require_both_localized && !local_robot_is_localized()) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "Remote-map fusion is gated until the local robot is localized (%s -> %s)",
+      params_.frame_id.c_str(), params_.base_frame_id.c_str());
+    return;
+  }
+
   const std::size_t count = msg->x.size();
   if (!occupancy_map_ || !dynamic_obstacle_map_) {
     return;
@@ -400,6 +412,16 @@ void BonxaiServer::voxel_delta_callback(
 
   apply_voxel_delta(source, *msg);
   updated_map_once_ = updated_map_once_ || count > 0U;
+}
+
+bool BonxaiServer::local_robot_is_localized() const
+{
+  if (!tf_buffer_) {
+    return false;
+  }
+  return tf_buffer_->canTransform(
+    params_.frame_id, params_.base_frame_id, tf2::TimePointZero,
+    tf2::durationFromSec(0.0));
 }
 
 void BonxaiServer::apply_voxel_delta(

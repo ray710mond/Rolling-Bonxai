@@ -54,6 +54,7 @@ struct BonxaiParams
   double occupancy_max_z{0.0};
   double occupancy_threshold{0.50};
   double fusion_conflict_tolerance_sec{5.0};
+  bool fusion_require_both_localized{true};
 
   double sensor_max_range{0.0};
   double sensor_hit{0.0};
@@ -130,6 +131,7 @@ private:
   void apply_voxel_delta(
     RemoteSourceLayer & source, const surf_multirobot_msgs::msg::VoxelDelta & msg);
   void reset_remote_source(RemoteSourceLayer & source, uint64_t map_epoch);
+  bool local_robot_is_localized() const;
   void get_fused_occupied_voxels(
     std::vector<Bonxai::CoordT> & coords, bool include_static, bool include_dynamic) const;
   void get_local_occupied_voxels(std::vector<Bonxai::CoordT> & coords) const;
