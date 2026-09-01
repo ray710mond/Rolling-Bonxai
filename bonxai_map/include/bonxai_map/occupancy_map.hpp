@@ -437,14 +437,6 @@ public:
      */
     [[nodiscard]] CoordT worldToVoxel(const Vector3D& point) const;
 
-    /**
-     * @brief Apply temporal decay to occupied voxels so dynamic obstacles can fade over time.
-     *
-     * @param dt_seconds Elapsed time since the previous decay update.
-     * @param decay_time_seconds Time constant over which occupancy decays toward free-space.
-     */
-    void applyTemporalDecay(double dt_seconds, double decay_time_seconds);
-    
     // ========================================================================
     // Updates (non-const methods)
     // ========================================================================

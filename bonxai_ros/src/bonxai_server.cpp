@@ -7,6 +7,8 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <queue>
 #include <set>
 #include <stdexcept>
 #include <unordered_set>
@@ -153,18 +155,29 @@ void BonxaiServer::load_parameters()
 
   params_.dynamic_obstacles_enabled =
     this->declare_parameter<bool>("dynamic_obstacles.enabled", true);
-  params_.dynamic_obstacle_decay_time_sec =
-    this->declare_parameter<double>("dynamic_obstacles.decay_time_sec", 2.0);
-  params_.dynamic_obstacle_decay_interval_sec =
-    this->declare_parameter<double>("dynamic_obstacles.decay_interval_sec", 0.25);
-  params_.dynamic_obstacle_static_demotion_time_sec =
-    this->declare_parameter<double>("dynamic_obstacles.static_demotion_time_sec", 20.0);
   params_.dynamic_obstacle_static_stability_hits =
     this->declare_parameter<int>("dynamic_obstacles.static_stability_hits", 3);
   params_.dynamic_obstacle_static_stability_time_sec =
     this->declare_parameter<double>("dynamic_obstacles.static_stability_time_sec", 1.0);
   params_.dynamic_obstacle_min_probability =
     this->declare_parameter<double>("dynamic_obstacles.min_probability", 0.05);
+  params_.dynamic_obstacle_cluster_connectivity_voxels =
+    this->declare_parameter<int>("dynamic_obstacles.cluster_connectivity_voxels", 1);
+  params_.dynamic_obstacle_spatial_tolerance_voxels =
+    this->declare_parameter<int>("dynamic_obstacles.spatial_tolerance_voxels", 1);
+  params_.dynamic_obstacle_sensor_noise_m =
+    this->declare_parameter<double>("dynamic_obstacles.sensor_noise_m", 0.075);
+  params_.dynamic_obstacle_static_confidence_threshold =
+    this->declare_parameter<double>("dynamic_obstacles.static_confidence_threshold", 0.7);
+
+  params_.dynamic_obstacle_cluster_connectivity_voxels =
+    std::max(1, params_.dynamic_obstacle_cluster_connectivity_voxels);
+  params_.dynamic_obstacle_spatial_tolerance_voxels =
+    std::max(0, params_.dynamic_obstacle_spatial_tolerance_voxels);
+  params_.dynamic_obstacle_sensor_noise_m =
+    std::max(1.0e-6, params_.dynamic_obstacle_sensor_noise_m);
+  params_.dynamic_obstacle_static_confidence_threshold = std::clamp(
+    params_.dynamic_obstacle_static_confidence_threshold, 0.0, 1.0);
 
   params_.static_map_path =
     this->declare_parameter<std::string>("map_storage.path", "");
@@ -187,7 +200,7 @@ void BonxaiServer::load_parameters()
     "\n  cleanup_interval=%.1fs"
     "\n  stats(enabled=%s quick=%s voxels=%s stats_rate=%.1fHz static_rate=%.1fHz dynamic_rate=%.1fHz)"
     "\n  fusion(require_both_localized=%s)"
-    "\n  dynamic_obstacles(enabled=%s dynamic_decay=%.2fs interval=%.2fs static_demotion=%.2fs stability_hits=%d stability_window=%.2fs)",
+    "\n  dynamic_obstacles(enabled=%s clearing=ray_only stability_hits=%d stability_window=%.2fs cluster_radius=%d tolerance=%d noise=%.3fm confidence=%.2f)",
     params_.static_resolution,
     params_.dynamic_resolution,
     params_.frame_id.c_str(),
@@ -210,11 +223,12 @@ void BonxaiServer::load_parameters()
     params_.dynamic_voxel_publish_rate,
     params_.fusion_require_both_localized ? "true" : "false",
     params_.dynamic_obstacles_enabled ? "true" : "false",
-    params_.dynamic_obstacle_decay_time_sec,
-    params_.dynamic_obstacle_decay_interval_sec,
-    params_.dynamic_obstacle_static_demotion_time_sec,
     params_.dynamic_obstacle_static_stability_hits,
-    params_.dynamic_obstacle_static_stability_time_sec);
+    params_.dynamic_obstacle_static_stability_time_sec,
+    params_.dynamic_obstacle_cluster_connectivity_voxels,
+    params_.dynamic_obstacle_spatial_tolerance_voxels,
+    params_.dynamic_obstacle_sensor_noise_m,
+    params_.dynamic_obstacle_static_confidence_threshold);
 }
 
 void BonxaiServer::init_tf()
@@ -848,16 +862,6 @@ void BonxaiServer::init_timers()
       params_.dynamic_voxel_publish_rate);
   }
 
-  if (params_.dynamic_obstacles_enabled) {
-    dynamic_decay_timer_ = this->create_wall_timer(
-      std::chrono::duration<double>(params_.dynamic_obstacle_decay_interval_sec),
-      std::bind(&BonxaiServer::decay_dynamic_obstacles, this));
-
-    RCLCPP_INFO(get_logger(),
-      "Dynamic obstacle decay enabled: decay=%.2fs interval=%.2fs",
-      params_.dynamic_obstacle_decay_time_sec,
-      params_.dynamic_obstacle_decay_interval_sec);
-  }
 }
 
 void BonxaiServer::pointcloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
@@ -982,65 +986,180 @@ void BonxaiServer::update_dynamic_obstacle_layer(
     return;
   }
 
+  std::set<Bonxai::CoordT> ray_cleared_voxels;
   {
     std::lock_guard<std::mutex> lock(local_observation_times_mutex_);
     dynamic_obstacle_map_->insertPointCloudObserved(
       map_points, sensor_origin, params_.sensor_max_range,
-      [this, observation_time_ns](const Bonxai::CoordT & coord, bool) {
+      [this, observation_time_ns, &ray_cleared_voxels](
+        const Bonxai::CoordT & coord, bool occupied) {
         const Bonxai::CoordT static_coord =
           params_.dynamic_resolution == params_.static_resolution ?
           coord : dynamic_to_static_coord(coord);
         local_observation_times_ns_[static_coord] = observation_time_ns;
+        if (!occupied) {
+          ray_cleared_voxels.insert(coord);
+        }
       });
   }
+  clear_dynamic_obstacles_from_rays(ray_cleared_voxels);
 
   const auto now = std::chrono::steady_clock::now();
-  std::set<Bonxai::CoordT> observed_voxels;
+  std::set<Bonxai::CoordT> all_observed_voxels;
   for (const auto& point : map_points) {
     const auto coord = dynamic_obstacle_map_->worldToVoxel(point);
-    observed_voxels.insert(coord);
+    all_observed_voxels.insert(coord);
   }
 
-  // Count at most one stability hit per voxel per cloud. Dense clouds often
-  // contain dozens of points in one voxel; counting points promoted an object
-  // to static during its very first scan.
-  for (const auto& coord : observed_voxels) {
-    const auto key = std::make_tuple(coord.x, coord.y, coord.z);
-    auto it = dynamic_obstacle_states_.find(key);
-
-    // The dynamic layer is the map delta: observations already represented
-    // by persistent static occupancy are background and are not transmitted.
-    if (dynamic_voxel_overlaps_static(coord)) {
-      if (it != dynamic_obstacle_states_.end()) {
-        if (it->second.promoted_to_static) {
-          it->second.last_seen = now;
-        } else {
-          dynamic_obstacle_states_.erase(it);
-        }
+  // Refresh promoted tracks before removing observations that overlap the
+  // static layer. This lets promoted obstacles remain reversible while known
+  // background remains excluded from the dynamic delta.
+  for (auto& [id, state] : dynamic_obstacle_states_) {
+    (void)id;
+    if (!state.promoted_to_static) {
+      continue;
+    }
+    for (const auto& coord : state.voxels) {
+      if (all_observed_voxels.count(coord) != 0U) {
+        state.last_seen = now;
+        break;
       }
+    }
+  }
+
+  std::set<Bonxai::CoordT> candidate_voxels;
+  for (const auto& coord : all_observed_voxels) {
+    if (!dynamic_voxel_overlaps_static(coord)) {
+      candidate_voxels.insert(coord);
+    }
+  }
+
+  // Associate each connected component with at most one recent track. Spatial
+  // overlap is tolerant to voxel-boundary jitter; centroid displacement turns
+  // persistence into a confidence value rather than a binary exact-cell hit.
+  std::set<uint64_t> matched_track_ids;
+  for (const auto& component : cluster_dynamic_voxels(candidate_voxels)) {
+    const Eigen::Vector3d centroid = dynamic_cluster_centroid(component);
+    auto best_it = dynamic_obstacle_states_.end();
+    double best_distance = std::numeric_limits<double>::infinity();
+
+    for (auto it = dynamic_obstacle_states_.begin(); it != dynamic_obstacle_states_.end(); ++it) {
+      auto& state = it->second;
+      const double age = std::chrono::duration<double>(now - state.last_seen).count();
+      if (state.promoted_to_static || matched_track_ids.count(state.id) != 0U ||
+          age > params_.dynamic_obstacle_static_stability_time_sec ||
+          !clusters_spatially_match(component, state.voxels)) {
+        continue;
+      }
+      const double distance = (centroid - state.centroid).norm();
+      if (distance < best_distance) {
+        best_distance = distance;
+        best_it = it;
+      }
+    }
+
+    if (best_it == dynamic_obstacle_states_.end()) {
+      DynamicClusterState state;
+      state.id = next_dynamic_cluster_id_++;
+      state.consecutive_hits = 1U;
+      state.static_confidence = 1.0;
+      state.last_seen = now;
+      state.centroid = centroid;
+      state.voxels = component;
+      dynamic_obstacle_states_.emplace(state.id, std::move(state));
       continue;
     }
 
-    if (it == dynamic_obstacle_states_.end()) {
-      it = dynamic_obstacle_states_.emplace(key, DynamicCellState{}).first;
-    }
-
-    auto& state = it->second;
-    const double elapsed_seconds = std::chrono::duration<double>(now - state.last_seen).count();
-    if (elapsed_seconds > params_.dynamic_obstacle_static_stability_time_sec) {
-      state.consecutive_hits = 1;
-    } else {
-      ++state.consecutive_hits;
-    }
+    auto& state = best_it->second;
+    matched_track_ids.insert(state.id);
+    ++state.consecutive_hits;
+    const double noise = std::max(
+      params_.dynamic_obstacle_sensor_noise_m, params_.dynamic_resolution * 0.5);
+    const double stability = std::exp(-0.5 * best_distance * best_distance / (noise * noise));
+    state.static_confidence +=
+      (stability - state.static_confidence) / static_cast<double>(state.consecutive_hits);
     state.last_seen = now;
+    state.centroid = centroid;
+    state.voxels = component;
 
-    if (!state.promoted_to_static &&
-        state.consecutive_hits >= static_cast<uint32_t>(params_.dynamic_obstacle_static_stability_hits)) {
-      state.promoted_static_coord = dynamic_to_static_coord(coord);
-      occupancy_map_->addHitPoint(state.promoted_static_coord);
+    if (state.consecutive_hits >=
+          static_cast<uint32_t>(params_.dynamic_obstacle_static_stability_hits) &&
+        state.static_confidence >= params_.dynamic_obstacle_static_confidence_threshold) {
+      for (const auto& coord : state.voxels) {
+        const auto static_coord = dynamic_to_static_coord(coord);
+        occupancy_map_->addHitPoint(static_coord);
+        state.promoted_static_coords.insert(static_coord);
+      }
       state.promoted_to_static = true;
     }
   }
+}
+
+std::vector<std::set<Bonxai::CoordT>> BonxaiServer::cluster_dynamic_voxels(
+  const std::set<Bonxai::CoordT>& voxels) const
+{
+  std::vector<std::set<Bonxai::CoordT>> clusters;
+  std::set<Bonxai::CoordT> remaining = voxels;
+  const int radius = std::max(1, params_.dynamic_obstacle_cluster_connectivity_voxels);
+
+  while (!remaining.empty()) {
+    std::set<Bonxai::CoordT> cluster;
+    std::queue<Bonxai::CoordT> frontier;
+    frontier.push(*remaining.begin());
+    remaining.erase(remaining.begin());
+
+    while (!frontier.empty()) {
+      const auto coord = frontier.front();
+      frontier.pop();
+      cluster.insert(coord);
+      for (int dx = -radius; dx <= radius; ++dx) {
+        for (int dy = -radius; dy <= radius; ++dy) {
+          for (int dz = -radius; dz <= radius; ++dz) {
+            if (dx == 0 && dy == 0 && dz == 0) {
+              continue;
+            }
+            const Bonxai::CoordT neighbor{coord.x + dx, coord.y + dy, coord.z + dz};
+            const auto it = remaining.find(neighbor);
+            if (it != remaining.end()) {
+              frontier.push(*it);
+              remaining.erase(it);
+            }
+          }
+        }
+      }
+    }
+    clusters.push_back(std::move(cluster));
+  }
+  return clusters;
+}
+
+Eigen::Vector3d BonxaiServer::dynamic_cluster_centroid(
+  const std::set<Bonxai::CoordT>& voxels) const
+{
+  Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+  for (const auto& coord : voxels) {
+    const auto point = dynamic_obstacle_map_->getGrid().coordToPos(coord);
+    centroid += Eigen::Vector3d(point.x, point.y, point.z);
+  }
+  return voxels.empty() ? centroid : centroid / static_cast<double>(voxels.size());
+}
+
+bool BonxaiServer::clusters_spatially_match(
+  const std::set<Bonxai::CoordT>& lhs, const std::set<Bonxai::CoordT>& rhs) const
+{
+  const int tolerance = std::max(0, params_.dynamic_obstacle_spatial_tolerance_voxels);
+  for (const auto& coord : lhs) {
+    for (int dx = -tolerance; dx <= tolerance; ++dx) {
+      for (int dy = -tolerance; dy <= tolerance; ++dy) {
+        for (int dz = -tolerance; dz <= tolerance; ++dz) {
+          if (rhs.count(Bonxai::CoordT{coord.x + dx, coord.y + dy, coord.z + dz}) != 0U) {
+            return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
 }
 
 Bonxai::CoordT BonxaiServer::dynamic_to_static_coord(const Bonxai::CoordT& coord) const
@@ -1063,12 +1182,17 @@ void BonxaiServer::reconcile_dynamic_with_static_map()
       continue;
     }
 
-    const auto& key = it->first;
-    const Bonxai::CoordT dynamic_coord{
-      std::get<0>(key), std::get<1>(key), std::get<2>(key)};
-    if (dynamic_voxel_overlaps_static(dynamic_coord)) {
+    for (auto voxel_it = it->second.voxels.begin(); voxel_it != it->second.voxels.end();) {
+      if (dynamic_voxel_overlaps_static(*voxel_it)) {
+        voxel_it = it->second.voxels.erase(voxel_it);
+      } else {
+        ++voxel_it;
+      }
+    }
+    if (it->second.voxels.empty()) {
       it = dynamic_obstacle_states_.erase(it);
     } else {
+      it->second.centroid = dynamic_cluster_centroid(it->second.voxels);
       ++it;
     }
   }
@@ -1077,36 +1201,43 @@ void BonxaiServer::reconcile_dynamic_with_static_map()
 void BonxaiServer::get_dynamic_obstacle_voxels(std::vector<Bonxai::CoordT>& coords) const
 {
   coords.clear();
-  coords.reserve(dynamic_obstacle_states_.size());
-  for (const auto& [key, state] : dynamic_obstacle_states_) {
+  for (const auto& [id, state] : dynamic_obstacle_states_) {
+    (void)id;
     if (!state.promoted_to_static) {
-      coords.push_back(Bonxai::CoordT{
-        std::get<0>(key), std::get<1>(key), std::get<2>(key)});
+      coords.insert(coords.end(), state.voxels.begin(), state.voxels.end());
     }
   }
 }
 
-void BonxaiServer::decay_dynamic_obstacles()
+void BonxaiServer::clear_dynamic_obstacles_from_rays(
+  const std::set<Bonxai::CoordT>& cleared_voxels)
 {
-  if (!dynamic_obstacle_map_ || !params_.dynamic_obstacles_enabled) {
+  if (!dynamic_obstacle_map_ || cleared_voxels.empty()) {
     return;
   }
 
-  const auto now = std::chrono::steady_clock::now();
-  const double dt_seconds = params_.dynamic_obstacle_decay_interval_sec;
-  dynamic_obstacle_map_->applyTemporalDecay(dt_seconds, params_.dynamic_obstacle_decay_time_sec);
-
   for (auto it = dynamic_obstacle_states_.begin(); it != dynamic_obstacle_states_.end();) {
-    const double age_seconds = std::chrono::duration<double>(now - it->second.last_seen).count();
-    const double expiration_seconds = it->second.promoted_to_static
-      ? params_.dynamic_obstacle_static_demotion_time_sec
-      : params_.dynamic_obstacle_decay_time_sec;
-    if (age_seconds > expiration_seconds) {
-      if (it->second.promoted_to_static) {
-        occupancy_map_->resetPoint(it->second.promoted_static_coord);
+    auto& state = it->second;
+    for (auto voxel_it = state.voxels.begin(); voxel_it != state.voxels.end();) {
+      if (cleared_voxels.count(*voxel_it) == 0U ||
+          dynamic_obstacle_map_->isOccupied(*voxel_it)) {
+        ++voxel_it;
+        continue;
       }
+
+      if (state.promoted_to_static) {
+        const auto static_coord = dynamic_to_static_coord(*voxel_it);
+        if (state.promoted_static_coords.erase(static_coord) != 0U) {
+          occupancy_map_->resetPoint(static_coord);
+        }
+      }
+      voxel_it = state.voxels.erase(voxel_it);
+    }
+
+    if (state.voxels.empty()) {
       it = dynamic_obstacle_states_.erase(it);
     } else {
+      state.centroid = dynamic_cluster_centroid(state.voxels);
       ++it;
     }
   }
@@ -1229,6 +1360,7 @@ bool BonxaiServer::load_static_map(std::string& error_message)
     occupancy_map_ = std::make_unique<Bonxai::OccupancyMap>(options, std::move(grid));
     dynamic_obstacle_map_ = std::make_unique<Bonxai::OccupancyMap>(params_.dynamic_resolution, options);
     dynamic_obstacle_states_.clear();
+    next_dynamic_cluster_id_ = 1U;
     updated_map_once_ = !occupancy_map_->getGrid().rootMap().empty();
     return true;
   } catch (const std::exception& exception) {

@@ -75,12 +75,13 @@ struct BonxaiParams
 
   // Dynamic obstacles
   bool dynamic_obstacles_enabled{true};
-  double dynamic_obstacle_decay_time_sec{2.0};
-  double dynamic_obstacle_decay_interval_sec{0.25};
-  double dynamic_obstacle_static_demotion_time_sec{20.0};
   int dynamic_obstacle_static_stability_hits{3};
   double dynamic_obstacle_static_stability_time_sec{1.0};
   double dynamic_obstacle_min_probability{0.05};
+  int dynamic_obstacle_cluster_connectivity_voxels{1};
+  int dynamic_obstacle_spatial_tolerance_voxels{1};
+  double dynamic_obstacle_sensor_noise_m{0.075};
+  double dynamic_obstacle_static_confidence_threshold{0.7};
 
   // Static map persistence
   std::string static_map_path;
@@ -90,12 +91,16 @@ struct BonxaiParams
   
 };
 
-struct DynamicCellState
+struct DynamicClusterState
 {
+  uint64_t id{0U};
   uint32_t consecutive_hits{0};
+  double static_confidence{0.0};
   std::chrono::steady_clock::time_point last_seen{std::chrono::steady_clock::now()};
   bool promoted_to_static{false};
-  Bonxai::CoordT promoted_static_coord{};
+  Eigen::Vector3d centroid{Eigen::Vector3d::Zero()};
+  std::set<Bonxai::CoordT> voxels;
+  std::set<Bonxai::CoordT> promoted_static_coords;
 };
 
 struct RemoteSourceLayer
@@ -180,8 +185,12 @@ private:
   Bonxai::CoordT dynamic_to_static_coord(const Bonxai::CoordT& coord) const;
   bool dynamic_voxel_overlaps_static(const Bonxai::CoordT& coord) const;
   void reconcile_dynamic_with_static_map();
-
-  void decay_dynamic_obstacles();
+  std::vector<std::set<Bonxai::CoordT>> cluster_dynamic_voxels(
+    const std::set<Bonxai::CoordT>& voxels) const;
+  Eigen::Vector3d dynamic_cluster_centroid(const std::set<Bonxai::CoordT>& voxels) const;
+  bool clusters_spatially_match(
+    const std::set<Bonxai::CoordT>& lhs, const std::set<Bonxai::CoordT>& rhs) const;
+  void clear_dynamic_obstacles_from_rays(const std::set<Bonxai::CoordT>& cleared_voxels);
 
   void fill_pcl_msg(
     const std::vector<Bonxai::CoordT>& coords,
@@ -200,7 +209,8 @@ private:
   // Occupancy maps
   std::unique_ptr<Bonxai::OccupancyMap> occupancy_map_;
   std::unique_ptr<Bonxai::OccupancyMap> dynamic_obstacle_map_;
-  std::map<std::tuple<int32_t, int32_t, int32_t>, DynamicCellState> dynamic_obstacle_states_;
+  std::map<uint64_t, DynamicClusterState> dynamic_obstacle_states_;
+  uint64_t next_dynamic_cluster_id_{1U};
   std::map<std::string, RemoteSourceLayer> remote_sources_;
   mutable std::mutex remote_sources_mutex_;
   std::unordered_map<Bonxai::CoordT, uint64_t> local_observation_times_ns_;
@@ -233,7 +243,6 @@ private:
   rclcpp::TimerBase::SharedPtr stats_timer_;
   rclcpp::TimerBase::SharedPtr static_voxel_timer_;
   rclcpp::TimerBase::SharedPtr dynamic_voxel_timer_;
-  rclcpp::TimerBase::SharedPtr dynamic_decay_timer_;
   
   // Statistics
   uint64_t point_clouds_processed_{0};
