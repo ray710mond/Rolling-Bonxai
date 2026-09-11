@@ -358,6 +358,18 @@ void BonxaiServer::voxel_delta_callback(
     return;
   }
 
+  if (msg->operating_mode == 4) {
+    std::lock_guard<std::mutex> lock(remote_sources_mutex_);
+    auto & source = remote_sources_[msg->source_id];
+    if (source.retired_epochs.count(msg->map_epoch)) {return;}
+    if (!source.occupancy || source.map_epoch != msg->map_epoch) {
+      reset_remote_source(source, msg->map_epoch);
+    }
+    apply_voxel_delta(source, *msg);
+    updated_map_once_ = updated_map_once_ || count > 0U;
+    return;
+  }
+
   if (msg->full_refresh) {
     // The receiver emits an empty version-zero full-refresh message as an epoch
     // reset sentinel. Preserve any currently displayed layer until the actual
@@ -490,8 +502,12 @@ void BonxaiServer::apply_voxel_delta(
         for (int64_t z = minimum.z; z <= maximum.z; ++z) {
           const Bonxai::CoordT coord{
             static_cast<int32_t>(x), static_cast<int32_t>(y), static_cast<int32_t>(z)};
-          source.occupancy->resetPoint(coord);
           const uint64_t observation_time_ns = msg.observation_time_ns[index];
+          const auto occupied_time = source.observation_times_ns.find(coord);
+          const auto deleted_time = source.deleted_observation_times_ns.find(coord);
+          if ((occupied_time != source.observation_times_ns.end() && observation_time_ns <= occupied_time->second) ||
+            (deleted_time != source.deleted_observation_times_ns.end() && observation_time_ns <= deleted_time->second)) continue;
+          source.occupancy->resetPoint(coord);
           switch (state) {
             case surf_multirobot_msgs::msg::VoxelDelta::STATE_OCCUPIED_STATIC:
               source.occupancy->addHitPoint(coord);
@@ -526,12 +542,15 @@ void BonxaiServer::apply_voxel_delta(
 
   source.occupancy->updateFreeCellsPreRayTrace();
   source.map_epoch = msg.map_epoch;
-  source.last_version = msg.version;
+  source.last_version = std::max(source.last_version, msg.version);
   source.awaiting_full_refresh = false;
 }
 
 void BonxaiServer::reset_remote_source(RemoteSourceLayer & source, uint64_t map_epoch)
 {
+  if (source.occupancy && source.map_epoch != map_epoch) {
+    source.retired_epochs.insert(source.map_epoch);
+  }
   source.map_epoch = map_epoch;
   source.last_version = 0U;
   source.awaiting_full_refresh = true;

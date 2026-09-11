@@ -107,6 +107,7 @@ struct RemoteSourceLayer
 {
   uint64_t map_epoch{0U};
   uint64_t last_version{0U};
+  std::set<uint64_t> retired_epochs;
   bool awaiting_full_refresh{true};
   std::unique_ptr<Bonxai::OccupancyMap> occupancy;
   std::set<Bonxai::CoordT> dynamic_voxels;
