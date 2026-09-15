@@ -122,6 +122,7 @@ public:
   ~BonxaiServer() override;
 
 private:
+  friend struct RemoteEvidenceTestAccess;
   // Initialization methods
   void load_parameters();
   void init_tf();

@@ -455,10 +455,14 @@ void BonxaiServer::apply_voxel_delta(
 {
   const std::size_t count = msg.x.size();
   const double source_resolution = static_cast<double>(msg.resolution);
+  // Resolution is float32 on the wire. 0.05f is slightly larger than 0.05;
+  // geometrically expanding that rounding error would free adjacent cells.
+  const bool same_resolution = std::abs(source_resolution - params_.static_resolution) <=
+    2 * std::numeric_limits<float>::epsilon() * params_.static_resolution;
   for (std::size_t index = 0; index < count; ++index) {
     const uint8_t state = msg.state[index];
     if (state < surf_multirobot_msgs::msg::VoxelDelta::STATE_OCCUPIED_STATIC ||
-      state > surf_multirobot_msgs::msg::VoxelDelta::STATE_DELETE)
+      state > surf_multirobot_msgs::msg::VoxelDelta::STATE_UNKNOWN)
     {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
         "Ignoring unknown voxel state %u", state);
@@ -479,8 +483,9 @@ void BonxaiServer::apply_voxel_delta(
       std::nextafter(upper.x(), lower.x()),
       std::nextafter(upper.y(), lower.y()),
       std::nextafter(upper.z(), lower.z()));
-    const auto minimum = source.occupancy->worldToVoxel(lower);
-    const auto maximum = source.occupancy->worldToVoxel(upper_inside);
+    const Bonxai::CoordT exact{msg.x[index], msg.y[index], msg.z[index]};
+    const auto minimum = same_resolution ? exact : source.occupancy->worldToVoxel(lower);
+    const auto maximum = same_resolution ? exact : source.occupancy->worldToVoxel(upper_inside);
     const int64_t cells_x = static_cast<int64_t>(maximum.x) - minimum.x + 1;
     const int64_t cells_y = static_cast<int64_t>(maximum.y) - minimum.y + 1;
     const int64_t cells_z = static_cast<int64_t>(maximum.z) - minimum.z + 1;
@@ -531,6 +536,13 @@ void BonxaiServer::apply_voxel_delta(
               source.dynamic_voxels.erase(coord);
               source.observation_times_ns.erase(coord);
               source.deleted_observation_times_ns[coord] = observation_time_ns;
+              break;
+            case surf_multirobot_msgs::msg::VoxelDelta::STATE_UNKNOWN:
+              // resetPoint above restores unknown. Retain the timestamp to
+              // reject delayed occupancy/free packets, without clearing peers.
+              source.dynamic_voxels.erase(coord);
+              source.observation_times_ns[coord] = observation_time_ns;
+              source.deleted_observation_times_ns.erase(coord);
               break;
             default:
               break;
